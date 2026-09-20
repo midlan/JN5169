@@ -146,9 +146,11 @@ void BasicClusterEndpoint::init()
 #ifdef SUPPORTS_POWER_METERING
     // Bit 0 = active measurement (AC)
     sElectricalMeasurementServerCluster.u32MeasurementType = 1;
-    // ActivePower is in W, RMSVoltage in 0.1 V, RMSCurrent in mA
+    // ActivePower is in 0.1 W, RMSVoltage in 0.1 V, RMSCurrent in mA.
+    // A 1 W divisor would round a 2.8 W bulb to 3 W; the integration window in
+    // EnergyMeterTask resolves well below 1 W, so report the decimal
     sElectricalMeasurementServerCluster.u16ACPowerMultiplier = 1;
-    sElectricalMeasurementServerCluster.u16ACPowerDivisor = 1;
+    sElectricalMeasurementServerCluster.u16ACPowerDivisor = 10;
     sElectricalMeasurementServerCluster.u16ACVoltageMultiplier = 1;
     sElectricalMeasurementServerCluster.u16ACVoltageDivisor = 10;
     sElectricalMeasurementServerCluster.u16ACCurrentMultiplier = 1;
@@ -317,8 +319,8 @@ void BasicClusterEndpoint::updateMeteringAttributes()
 {
     EnergyMeterTask * meter = EnergyMeterTask::getInstance();
 
-    // CF -> active power (W); CF1 -> RMS voltage (0.1 V) / RMS current (mA) per SEL mode
-    sElectricalMeasurementServerCluster.i16ActivePower = meter->getActivePowerW();
+    // CF -> active power (0.1 W); CF1 -> RMS voltage (0.1 V) / RMS current (mA) per SEL mode
+    sElectricalMeasurementServerCluster.i16ActivePower = meter->getActivePowerDW();
     sElectricalMeasurementServerCluster.u16RMSVoltage = meter->getVoltageDV();
     sElectricalMeasurementServerCluster.u16RMSCurrent = meter->getCurrentMA();
 

@@ -34,14 +34,27 @@ main loop is busy (observed ±25 % under radio storms — a brushed-motor load n
 antenna is an effective jammer), and since both channels scale by the same wrong factor
 the corrupted readings look internally consistent. Timer 0 free-runs as a timebase
 (16 MHz / 2^14 = 976.5625 Hz; DIO takeover disabled — its pins overlap CF/SEL/button)
-and every window computes `freq = pulses × 78125 / (ticks × 8)`, immune to callback
-jitter. Frequencies are kept in 0.1 Hz units ("dHz").
+and each acquisition tick measures its own length, immune to callback jitter.
+
+**Integration window — why sampling and integration are separate.** Low loads are
+sub-Hz on CF (1 W ≈ 0.24 Hz), so a 1 s measurement holds 0 or 1 pulse and quantises the
+reading to ~4.5 W steps. Precision therefore comes from integrating over many seconds
+— but *sampling* the hardware that rarely is not an option: the pulse counters are only
+16 bit and CF1 reaches ~2.2 kHz at 16 A, so a 20 s hardware sampling period would already
+sit at 44k of the 65535 range and 60 s would wrap silently under load (the timebase timer
+wraps at 67 s too). The two concerns are decoupled: the counters are read **every
+second** (wrap-free deltas) and pulses and timebase ticks are summed into **32-bit
+windows of 20 ticks**, from which the calibrated values are derived directly —
+`value = pulses × 15625 × K / (ticks × 16 × 10000)`, with no intermediate frequency
+rounding to throw away the resolution the window just bought. A 20 s window collects ~5
+pulses at 1 W and resolves ~0.2 W, and extending it further only needs a larger
+`INTEGRATION_TICKS` — no counter-range arithmetic changes with it.
 
 **SEL multiplexing:** the polarity had to be resolved empirically — with DIO9 driven low
 CF1 outputs *voltage* pulses (the 2N7002 inverts on the way to the chip). SEL alternates
-every 5 windows; the window straddling a toggle is discarded (mode change + HLW8012
-settle) and each mode keeps its last valid frequency, so voltage stays fresh while
-current is measured.
+once per integration window, and only the single acquisition tick straddling the toggle
+is discarded (mode change + HLW8012 settle) — 19 of 20 ticks remain valid. Each mode
+keeps its last completed window, so voltage stays fresh while current is measured.
 
 ## Calibration — integrate counts, then anchor to references
 
@@ -72,7 +85,10 @@ unit, or expect a few percent error from copying another unit's values.
 
 Both clusters sit on the basic (common) endpoint, next to DeviceTemperature:
 
-- **Electrical Measurement (0x0B04):** `activePower` (W, multiplier 1 / divisor 1),
+- **Electrical Measurement (0x0B04):** `activePower` (0.1 W, multiplier 1 / divisor 10 —
+  a 1 W step would round a 2.8 W bulb to 3 W; the attribute is a *signed* int16, so
+  0.1 W units cap at 3276.7 W, comfortably above the 10 A / 2500 W both models are rated
+  for — the two-gang QBKG12LM meters its single shared mains input with one HLW8012),
   `rmsVoltage` (0.1 V, divisor 10), `rmsCurrent` (mA, divisor 1000), plus the cumulative
   count attributes above.
 - **Simple Metering (0x0702):** `currentSummationDelivered` in Wh (multiplier 1 /
@@ -118,5 +134,7 @@ standard z2m configure flow.
 - QBKG12LM very likely carries the same metering circuit, but its HLW8012→DIO wiring has
   not been verified, so the driver is enabled for QBKG11LM only
   (`SUPPORTS_POWER_METERING` in `zcl_options.h`).
-- Low loads produce sub-Hz CF (0.5 W ≈ 0.12 Hz): 1 s windows legitimately read 0 W
-  between pulses. The energy register integrates correctly regardless.
+- Very low loads remain coarse: at 0.5 W (≈ 0.12 Hz) a 20 s window collects 2–3 pulses,
+  so the reading still steps visibly. The energy register integrates correctly
+  regardless, and `INTEGRATION_TICKS` can be raised if steadier low-load readings matter
+  more than update rate.

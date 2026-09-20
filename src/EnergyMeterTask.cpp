@@ -11,19 +11,30 @@ extern "C"
     #include "dbg.h"
 }
 
-// Must stay well below the ~30 s wrap time of a 16-bit counter at the
-// maximum expected pulse frequency (~2.2 kHz on CF1 at 16 A)
+// Acquisition tick. Deliberately short: the 16-bit pulse counters must not be
+// able to wrap between two reads (worst case is CF1 at ~2.2 kHz for 16 A, so
+// ~2.2k pulses per tick against a 65535 range), and Timer 0 wraps after 67 s
 static const uint32 SAMPLE_PERIOD_MS = 1000;
+
+// Pulses and timebase ticks are summed over this many acquisition ticks before
+// the measured values are refreshed. Precision at low load comes from the
+// length of the integration window, not from the length of the hardware
+// sampling period: at 1 W, CF runs at ~0.24 Hz, so a 1 s window holds 0 or 1
+// pulse and quantises the reading to ~4.5 W steps, while 20 s collects ~5
+// pulses and resolves ~0.2 W. Summing into 32 bits is what makes the long
+// window safe - sampling the hardware every 20 s would already sit at 44k of
+// the counter's 65535 range, and 60 s would wrap it silently at high load
+static const uint8 INTEGRATION_TICKS = 20;
 
 // Timer 0 free-runs as the sampling timebase: 16 MHz / 2^14 = 976.5625 Hz.
 // The ZTIMER 1 s callback jitters when the main loop is busy (radio storms),
-// so the window length is measured, never assumed. 16-bit wrap = 67 s.
+// so the window length is measured, never assumed. 16-bit wrap = 67 s
 static const uint8 TIMEBASE_PRESCALE = 14;
-// freq[dHz] = pulses * 976.5625 * 10 / ticks = pulses * 78125 / (ticks * 8)
-static const uint32 TIMEBASE_DHZ_MUL = 78125;
-static const uint32 TIMEBASE_DHZ_DIV = 8;
+// 976.5625 Hz as an exact fraction: freq[Hz] = pulses * 15625 / (16 * ticks)
+static const uint32 TIMEBASE_HZ_NUM = 15625;
+static const uint32 TIMEBASE_HZ_DEN = 16;
 
-// Conversion constants, scaled by 1e5: value = freq_dHz * K / 100000.
+// Conversion constants, scaled by 1e4: value = freq_Hz * K / 10000.
 // Power: calibrated 2026-08-02 against an inline power meter (1910 W at
 // 424.41 Hz CF over a 3 min pulse-count integration) -> 4.5004 W/Hz,
 // +8.8 % over the datasheet-nominal 4.138 (shunt below its marked 2 mOhm).
@@ -33,14 +44,17 @@ static const uint32 TIMEBASE_DHZ_DIV = 8;
 // and the shunt, so Kc = Kp/Kv (+4.05 % over nominal; PF cross-check 0.966).
 // Constants are specimen-calibrated on a QBKG11LM; QBKG11LM and QBKG12LM
 // share the same board, so they serve as defaults for both.
-static const uint32 METERING_W_PER_DHZ_E5 = 45004;
-static const uint32 METERING_DV_PER_DHZ_E5 = 34176;
-static const uint32 METERING_MA_PER_DHZ_E5 = 75357;
+static const uint32 METERING_W_PER_HZ_E4 = 45004;
+static const uint32 METERING_DV_PER_HZ_E4 = 34176;
+static const uint32 METERING_MA_PER_HZ_E4 = 75357;
 
-// SEL alternates CF1 between voltage and current mode every N sampling
-// windows; the window straddling the toggle is discarded (mode change +
-// HLW8012 settle), leaving N-1 valid windows per dwell
-static const uint8 SEL_DWELL_TICKS = 5;
+// ZCL ActivePower is a *signed* 16-bit value, so reporting in 0.1 W units
+// (ACPowerDivisor = 10) caps at 3276.7 W. Both QBKG11LM and QBKG12LM are rated
+// 10 A / 2500 W in total - the two-gang model meters its single shared mains
+// input with one HLW8012 - so the cap sits above anything either switch may
+// legally carry
+static const uint32 ACTIVE_POWER_DW_MAX = 32767;
+static const uint32 CURRENT_MA_MAX = 65535;
 
 // Energy register persistence: save when this many pulses accumulated since
 // the last save (~0.1 kWh at the calibrated 4.5 J/pulse), or daily if any
@@ -74,13 +88,15 @@ EnergyMeterTask::EnergyMeterTask()
     bAHI_Read16BitCounter(E_AHI_PC_1, &prevCfCount);
     bAHI_Read16BitCounter(E_AHI_PC_0, &prevCf1Count);
     prevTimebaseTicks = u16AHI_TimerReadCount(E_AHI_TIMER_0);
-    cfFreqDHz = 0;
-    voltageFreqDHz = 0;
-    currentFreqDHz = 0;
+    cfWindow.reset();
+    cf1Window.reset();
+    windowTicks = 0;
+    cfResult.reset();
+    voltageResult.reset();
+    currentResult.reset();
     cf1Total = 0;
     selCurrentMode = 0;         // constructor drove SEL low = voltage mode
-    modeTicks = 0;
-    transitionWindow = false;
+    selSettleTick = false;
 
     // Restore the lifetime energy register
     persistedEnergyPulses.init((uint64)0, "Energy");
@@ -99,37 +115,53 @@ EnergyMeterTask * EnergyMeterTask::getInstance()
     return &instance;
 }
 
-static uint16 freqDHz(uint16 pulses, uint16 ticks)
+// value = freq[Hz] * kE4 / 10000, scaled by `scale` to reach the reporting
+// unit (10 for 0.1 W). A full window holds ~44k pulses and ~20k ticks, so the
+// numerator needs 64 bits - but nothing is rounded before the final division
+static uint32 calibratedValue(const PulseWindow & window, uint32 kE4, uint32 scale)
 {
-    if(ticks == 0)
+    if(window.ticks == 0)
         return 0;
 
-    uint64 f = (uint64)pulses * TIMEBASE_DHZ_MUL / ((uint32)ticks * TIMEBASE_DHZ_DIV);
+    uint64 numerator = (uint64)window.pulses * TIMEBASE_HZ_NUM * kE4 * scale;
+    return (uint32)(numerator / ((uint64)window.ticks * TIMEBASE_HZ_DEN * 10000));
+}
+
+static uint16 freqDHz(const PulseWindow & window)
+{
+    if(window.ticks == 0)
+        return 0;
+
+    uint64 f = (uint64)window.pulses * TIMEBASE_HZ_NUM * 10 / ((uint64)window.ticks * TIMEBASE_HZ_DEN);
     return (f > 65535) ? 65535 : (uint16)f;
 }
 
-
-uint16 EnergyMeterTask::getActivePowerW() const
+uint16 EnergyMeterTask::getCfFreqDHz() const
 {
-    uint32 watts = (uint32)cfFreqDHz * METERING_W_PER_DHZ_E5 / 100000;
-    return (watts > 32767) ? 32767 : watts;    // ZCL ActivePower is int16
+    return freqDHz(cfResult);
+}
+
+uint16 EnergyMeterTask::getActivePowerDW() const
+{
+    uint32 deciWatts = calibratedValue(cfResult, METERING_W_PER_HZ_E4, 10);
+    return (deciWatts > ACTIVE_POWER_DW_MAX) ? ACTIVE_POWER_DW_MAX : deciWatts;
 }
 
 uint16 EnergyMeterTask::getVoltageDV() const
 {
-    return (uint32)voltageFreqDHz * METERING_DV_PER_DHZ_E5 / 100000;
+    return calibratedValue(voltageResult, METERING_DV_PER_HZ_E4, 1);
 }
 
 uint16 EnergyMeterTask::getCurrentMA() const
 {
-    uint32 mA = (uint32)currentFreqDHz * METERING_MA_PER_DHZ_E5 / 100000;
-    return (mA > 65535) ? 65535 : mA;
+    uint32 mA = calibratedValue(currentResult, METERING_MA_PER_HZ_E4, 1);
+    return (mA > CURRENT_MA_MAX) ? CURRENT_MA_MAX : mA;
 }
 
 uint64 EnergyMeterTask::getEnergyWh() const
 {
     // Each CF pulse is a fixed energy quantum: Wh = pulses * (W/Hz) / 3600
-    return cfTotal * METERING_W_PER_DHZ_E5 / 36000000;
+    return cfTotal * METERING_W_PER_HZ_E4 / 36000000;
 }
 
 void EnergyMeterTask::timerCallback()
@@ -149,29 +181,14 @@ void EnergyMeterTask::timerCallback()
     cfTotal += cfDelta;
     cf1Total += cf1Delta;
 
-    cfFreqDHz = freqDHz(cfDelta, tickDelta);
+    // CF is not multiplexed - every tick belongs to the power window
+    cfWindow.add(cfDelta, tickDelta);
 
-    // Attribute the CF1 window to the mode that was active throughout it
-    uint16 cf1FreqDHz = freqDHz(cf1Delta, tickDelta);
-    if(transitionWindow)
-        transitionWindow = false;
-    else if(selCurrentMode)
-        currentFreqDHz = cf1FreqDHz;
+    // CF1 is only attributable to a mode that was active for the whole tick
+    if(selSettleTick)
+        selSettleTick = false;
     else
-        voltageFreqDHz = cf1FreqDHz;
-
-    // Alternate SEL between voltage and current measurement
-    if(++modeTicks >= SEL_DWELL_TICKS)
-    {
-        selCurrentMode ^= 1;
-        // DIO9 low = voltage mode, high = current mode (2N7002 inverts on its way to SEL)
-        if(selCurrentMode)
-            vAHI_DioSetOutput(METERING_SEL_MASK, 0);
-        else
-            vAHI_DioSetOutput(0, METERING_SEL_MASK);
-        modeTicks = 0;
-        transitionWindow = true;
-    }
+        cf1Window.add(cf1Delta, tickDelta);
 
     // Wear-aware persistence of the energy register
     ticksSinceSave++;
@@ -183,15 +200,41 @@ void EnergyMeterTask::timerCallback()
         ticksSinceSave = 0;
     }
 
+    if(++windowTicks >= INTEGRATION_TICKS)
+    {
+        // Publish the integrated windows and start the next pair
+        cfResult = cfWindow;
+        if(selCurrentMode)
+            currentResult = cf1Window;
+        else
+            voltageResult = cf1Window;
+
+        DBG_vPrintf(TRUE, "EnergyMeterTask: CF=%d.%d Hz (%d pulses), CF1=%d.%d Hz mode=%c (%d pulses / %d ticks)\n",
+                    getCfFreqDHz() / 10, getCfFreqDHz() % 10, (uint16)cfWindow.pulses,
+                    freqDHz(cf1Window) / 10, freqDHz(cf1Window) % 10,
+                    selCurrentMode ? 'I' : 'V', (uint16)cf1Window.pulses, (uint16)cf1Window.ticks);
+
+        cfWindow.reset();
+        cf1Window.reset();
+        windowTicks = 0;
+
+        // Alternate SEL between voltage and current measurement. The next tick
+        // spans the mode change, so it is dropped from the CF1 window - only
+        // one tick is lost per window, not the whole window
+        selCurrentMode ^= 1;
+        // DIO9 low = voltage mode, high = current mode (2N7002 inverts on its way to SEL)
+        if(selCurrentMode)
+            vAHI_DioSetOutput(METERING_SEL_MASK, 0);
+        else
+            vAHI_DioSetOutput(0, METERING_SEL_MASK);
+        selSettleTick = true;
+    }
+
     // Push fresh values into the ZCL cluster structs so both reads and the
-    // attribute reporting engine (which samples the structs directly) see
-    // current data
+    // attribute reporting engine (which samples the structs directly when it
+    // evaluates the reportable change) see current data
     if(meteringEndpoint)
         meteringEndpoint->updateMeteringAttributes();
-
-    DBG_vPrintf(TRUE, "EnergyMeterTask: CF=%d.%d Hz, CF1=%d.%d Hz mode=%c (window %d ticks)\n",
-                cfFreqDHz / 10, cfFreqDHz % 10, cf1FreqDHz / 10, cf1FreqDHz % 10,
-                selCurrentMode ? 'I' : 'V', tickDelta);
 }
 
 #endif // SUPPORTS_POWER_METERING
